@@ -273,6 +273,12 @@ def fmt_elapsed(seconds):
 # Semaphore for limiting concurrent agent sessions
 session_semaphore = threading.Semaphore(MAX_CONCURRENT_SESSIONS)
 
+# Bumped by /reset. Worker threads capture the epoch when they start and
+# abort silently once it changes, so a reset actually stops in-flight
+# processing instead of the retry logic resurrecting killed sessions
+# against the freshly wiped database.
+RESET_EPOCH = 0
+
 
 def devin_v1_headers():
     return {
@@ -424,9 +430,14 @@ def resume_session_monitor(issue_id, session_id):
     append_event(session_id, issue_id, 'status',
                  'Operator restarted — re-attached to the running Devin session')
 
+    epoch = RESET_EPOCH
     try:
         with session_semaphore:
             session_result = poll_devin_session(session_id, issue_id)
+
+        if session_result['status'] == 'cancelled' or RESET_EPOCH != epoch:
+            print(f'[RESUME] Monitoring of session {session_id} cancelled by reset')
+            return
 
         if session_result['status'] == 'completed':
             finalize_completed_session(issue_id, issue_data, session_id, session_result)
@@ -434,6 +445,9 @@ def resume_session_monitor(issue_id, session_id):
 
         error_msg = session_result.get('error', 'Unknown error')
     except Exception as e:
+        if RESET_EPOCH != epoch:
+            print(f'[RESUME] Monitoring of session {session_id} cancelled by reset')
+            return
         error_msg = str(e)
 
     conn = get_db()
@@ -506,12 +520,17 @@ def poll_devin_session(session_id, issue_id):
     """
     deadline = time.monotonic() + SESSION_TIMEOUT_SECONDS
     started = time.monotonic()
+    epoch = RESET_EPOCH
     nudged_blocked = False
     pr_recorded = False
     seen_message_ids = set()
     last_status = None
 
     while time.monotonic() < deadline:
+        if RESET_EPOCH != epoch:
+            print(f'[MONITOR] Session {session_id} polling cancelled by reset')
+            return {'status': 'cancelled'}
+
         try:
             response = requests.get(
                 f'{DEVIN_API_BASE}/v1/sessions/{session_id}',
@@ -826,12 +845,21 @@ def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
 
     issue_data = dict(issue)
     branch_name = f"devin/fix-issue-{issue_data['issue_number']}"
+    epoch = RESET_EPOCH
 
     for attempt in range(1, max_retries + 1):
         try:
+            if RESET_EPOCH != epoch:
+                print(f"[PROCESS] Issue #{issue_data['issue_number']} processing cancelled by reset")
+                return False
+
             print(f"[PROCESS] Attempt {attempt}/{max_retries} for issue #{issue_data['issue_number']}")
 
             with session_semaphore:
+                if RESET_EPOCH != epoch:
+                    print(f"[PROCESS] Issue #{issue_data['issue_number']} processing cancelled by reset")
+                    return False
+
                 session_data = create_devin_session(issue_data, branch_name, attempt)
 
                 conn = get_db()
@@ -863,6 +891,12 @@ def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
                              f"and reading issue #{issue_data['issue_number']}")
 
                 session_result = poll_devin_session(sid, issue_id)
+
+            # Reset wiped this issue while we were working: stop silently,
+            # write nothing, and above all do not retry
+            if session_result['status'] == 'cancelled' or RESET_EPOCH != epoch:
+                print(f"[PROCESS] Issue #{issue_data['issue_number']} processing cancelled by reset")
+                return False
 
             if session_result['status'] == 'completed':
                 finalize_completed_session(issue_id, issue_data,
@@ -899,6 +933,10 @@ def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
             print(f"[RETRY] Issue #{issue_data['issue_number']} failed on attempt {attempt}")
 
         except Exception as e:
+            if RESET_EPOCH != epoch:
+                print(f"[PROCESS] Issue #{issue_data['issue_number']} processing cancelled by reset")
+                return False
+
             print(f"[ERROR] Exception in processing issue #{issue_data['issue_number']}: {e}")
             try:
                 append_event(session_data['session_id'], issue_id, 'error', f'Attempt {attempt} error: {e}')
@@ -1358,23 +1396,34 @@ def complete_session(session_id):
 def reset_system():
     """
     Reset the demo to its initial state:
-    1. Terminate Devin sessions that are still running
-    2. Close the PRs raised for tracked issues and delete their branches
-    3. Close each processed GitHub issue and recreate it as a fresh copy
+    1. Cancel all in-flight worker threads (epoch bump) so nothing retries
+       against the wiped database
+    2. Terminate Devin sessions that are still running
+    3. Close the PRs raised for tracked issues and delete their branches
+    4. Close each processed GitHub issue and recreate it as a fresh copy
        (same title/body/labels minus the trigger label; the copy gets a
        new issue number, which is fine - content is what matters)
-    4. Clear the local database
+    5. Sweep GitHub for any stray open devin/fix-issue-* PRs the database
+       does not know about (e.g. raised by a session that outlived an
+       earlier reset) and close them too
+    6. Clear the local database
 
     Re-adding the trigger label to a fresh copy runs the pipeline again.
     Best-effort: individual GitHub/Devin failures are collected in 'errors'
     rather than aborting the reset.
     """
+    global RESET_EPOCH
+
     if not GITHUB_TOKEN:
         return jsonify({
             'error': 'GITHUB_TOKEN must be set: reset closes PRs/issues and recreates tickets via the GitHub API'
         }), 501
 
     try:
+        # Cancel in-flight threads before anything else: killing their
+        # sessions without this makes the retry logic spawn replacements
+        RESET_EPOCH += 1
+
         actions = []
         errors = []
 
@@ -1438,6 +1487,29 @@ def reset_system():
                 actions.append(f"Closed issue #{number} and recreated it as #{copy['number']}")
             except requests.exceptions.RequestException as e:
                 errors.append(f'Could not close and recreate issue #{number}: {e}')
+
+        # Sweep for stray fix PRs the database does not know about, e.g.
+        # opened by a session that outlived an earlier reset
+        try:
+            open_prs = github_request('GET', f'/repos/{REPO_FULL_NAME}/pulls',
+                                      params={'state': 'open', 'per_page': 100}).json()
+            for pr in open_prs:
+                head_ref = (pr.get('head') or {}).get('ref', '')
+                if not head_ref.startswith('devin/fix-issue-'):
+                    continue
+                try:
+                    github_request('PATCH', f"/repos/{REPO_FULL_NAME}/pulls/{pr['number']}",
+                                   json={'state': 'closed'})
+                    actions.append(f"Closed stray PR #{pr['number']} ({head_ref})")
+                except requests.exceptions.RequestException as e:
+                    errors.append(f"Could not close stray PR #{pr['number']}: {e}")
+                try:
+                    github_request('DELETE', f'/repos/{REPO_FULL_NAME}/git/refs/heads/{head_ref}')
+                    actions.append(f'Deleted branch {head_ref}')
+                except requests.exceptions.RequestException:
+                    pass  # branch already gone
+        except requests.exceptions.RequestException as e:
+            errors.append(f'Could not sweep for stray PRs: {e}')
 
         conn = get_db()
         cursor = conn.cursor()
