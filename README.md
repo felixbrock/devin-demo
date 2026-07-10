@@ -1,5 +1,9 @@
 # Devin Demo — Automated Issue Remediation
 
+**You can find the demo video [here](https://www.loom.com/share/d82ee4f3cdfa416baed6cbd5edb468ce)**
+
+## What the system does
+
 Label a GitHub issue `devin-fix`. The system spins up a **Devin** session that writes a root-cause fix and opens a PR as its final action, which completes the ticket and triggers an automatic Devin Review. A live dashboard tracks every issue from open to merged.
 
 Target repo is a fork of Apache Superset; the security tickets to remediate carry the `created by Devin` label.
