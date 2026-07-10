@@ -6,6 +6,8 @@ Target repo is a fork of Apache Superset; the security tickets to remediate carr
 
 ## Quick Start
 
+If there are any open issues or pull requests in the Superset fork, the system must first be [reset](#reset-between-takes) before the demo can begin.
+
 ```bash
 cp .env.example .env          # fill in at least DEVIN_API_KEY and GITHUB_TOKEN
 docker-compose up --build     # webhook :8000 · operator :8001 · dashboard :3000
