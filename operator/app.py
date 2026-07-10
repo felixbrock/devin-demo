@@ -365,13 +365,21 @@ def send_session_message(session_id, message):
 
 
 def terminate_devin_session(session_id):
-    """Terminate a Devin session via DELETE /v1/sessions/{session_id}"""
+    """
+    Terminate a Devin session via DELETE /v1/sessions/{session_id}.
+    A session that is already gone (terminated earlier, expired) counts
+    as success - the goal is that it is not running.
+    """
     try:
-        requests.delete(
+        response = requests.delete(
             f'{DEVIN_API_BASE}/v1/sessions/{session_id}',
             headers=devin_v1_headers(),
             timeout=30
-        ).raise_for_status()
+        )
+        if response.status_code in (400, 404, 410):
+            print(f'[DEVIN API] Session {session_id} already gone ({response.status_code})')
+            return True
+        response.raise_for_status()
         print(f'[DEVIN API] Terminated session {session_id}')
         return True
     except requests.exceptions.RequestException as e:
