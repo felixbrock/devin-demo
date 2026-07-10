@@ -239,6 +239,54 @@ a { color: var(--ink); }
   letter-spacing: 0.07em;
   color: var(--muted);
 }
+/* Live Devin activity log inside an active card */
+.logfeed {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.logfeed-head {
+  font-family: var(--sans);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--faint);
+  margin-bottom: 8px;
+}
+.logfeed-live { color: var(--accent); }
+.logfeed-empty {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--faint);
+  font-style: italic;
+}
+.logfeed-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 168px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.logline {
+  display: flex;
+  gap: 9px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.logline-time {
+  flex: none;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  padding-top: 1px;
+}
+.logline-msg { color: var(--muted); word-break: break-word; }
+.logline-user .logline-msg { color: var(--low); font-style: italic; }
+.logline:first-child .logline-msg { color: var(--ink); }
+
 /* Severity badge */
 .sev {
   font-family: var(--sans);

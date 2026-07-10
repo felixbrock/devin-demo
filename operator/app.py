@@ -148,6 +148,13 @@ def init_db():
         )
     ''')
 
+    # Columns added to agent_sessions after the initial schema
+    for column_def in ('messages TEXT',):
+        try:
+            cursor.execute(f'ALTER TABLE agent_sessions ADD COLUMN {column_def}')
+        except sqlite3.OperationalError:
+            pass
+
     # State transitions table for audit trail
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS state_transitions (
@@ -396,12 +403,18 @@ def poll_devin_session(session_id, issue_id):
         log_line = f"{datetime.utcnow().isoformat()}Z status={status}"
         print(f"[MONITOR] Session {session_id} (issue {issue_id}): {status}")
 
+        # Devin returns the full activity timeline each poll; persist the latest
+        # so the dashboard can show Devin's live progress messages.
+        messages_json = json.dumps(session.get('messages') or [])
+
         conn = get_db()
         conn.execute('''
             UPDATE agent_sessions
-            SET logs = COALESCE(logs, '') || ? || char(10), updated_at = CURRENT_TIMESTAMP
+            SET logs = COALESCE(logs, '') || ? || char(10),
+                messages = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE session_id = ?
-        ''', (log_line, session_id))
+        ''', (log_line, messages_json, session_id))
         conn.commit()
         conn.close()
 
@@ -851,6 +864,8 @@ def tracking_by_number():
         SELECT i.issue_number, i.status, i.agent_session_id, i.pr_url, i.pr_number,
                i.branch_name, i.review_status, i.error_message, i.completed_at,
                i.test_results, i.tests_added,
+               (SELECT s.messages FROM agent_sessions s WHERE s.issue_id = i.id
+                    ORDER BY s.started_at DESC LIMIT 1) AS session_messages,
                (SELECT MIN(s.started_at) FROM agent_sessions s WHERE s.issue_id = i.id)
                    AS work_started_at
         FROM issues i
@@ -859,6 +874,36 @@ def tracking_by_number():
     rows = {row['issue_number']: dict(row) for row in cursor.fetchall()}
     conn.close()
     return rows
+
+
+def recent_messages(raw, limit=14):
+    """Parse stored Devin session messages JSON into a compact recent feed.
+
+    Devin's GET session response returns a `messages` array of activity events
+    (type, message, timestamp) representing what the agent is doing. We keep the
+    most recent `limit` so the dashboard can render a live progress log.
+    """
+    if not raw:
+        return []
+    try:
+        msgs = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(msgs, list):
+        return []
+    out = []
+    for m in msgs[-limit:]:
+        if not isinstance(m, dict):
+            continue
+        text = (m.get('message') or '').strip()
+        if not text:
+            continue
+        out.append({
+            'type': m.get('type'),
+            'message': text[:600],
+            'timestamp': m.get('timestamp'),
+        })
+    return out
 
 
 def tests_passed_from(text):
@@ -917,6 +962,10 @@ def list_tickets():
     tickets = []
     for gh in gh_issues:
         number = gh['number']
+        # Closed issues with no work history are reset leftovers (originals
+        # replaced by a fresh copy) - hide them so tickets don't show twice
+        if gh.get('state') != 'open' and number not in tracking:
+            continue
         body = gh.get('body')
         cvss = parse_cvss(body)
         track = tracking.get(number, {})
@@ -937,6 +986,7 @@ def list_tickets():
             'test_results': track.get('test_results'),
             'tests_added': bool(track.get('tests_added')) if track.get('tests_added') is not None else None,
             'tests_passed': tests_passed_from(track.get('test_results')),
+            'messages': recent_messages(track.get('session_messages')),
             'work_started_at': track.get('work_started_at'),
             'completed_at': track.get('completed_at'),
         })
@@ -1162,7 +1212,11 @@ def reset_system():
                 errors.append(f'Could not fetch original issue #{number}, copying from local data: {e}')
 
             try:
-                github_request('PATCH', f'/repos/{repo}/issues/{number}', json={'state': 'closed'})
+                # Close the original and strip the demo labels so it drops out
+                # of the dashboard catalog; the fresh copy carries them instead
+                leftover_labels = [l for l in labels if l != CATALOG_LABEL]
+                github_request('PATCH', f'/repos/{repo}/issues/{number}',
+                               json={'state': 'closed', 'labels': leftover_labels})
                 copy = github_request('POST', f'/repos/{repo}/issues',
                                       json={'title': title, 'body': body, 'labels': labels}).json()
                 actions.append(f"Closed issue #{number} and recreated it as #{copy['number']}")

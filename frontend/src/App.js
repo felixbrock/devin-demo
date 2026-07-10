@@ -151,6 +151,7 @@ function App() {
                   <span className="timer-val">{formatElapsed(r.workingMs)}</span>
                   <span className="timer-lbl">{r.live ? 'agent working' : 'queued'}</span>
                 </div>
+                <LogFeed messages={r.messages} live={r.live} />
               </article>
             ))}
           </div>
@@ -236,6 +237,41 @@ function SeverityBadge({ severity, cvss }) {
     <span className={`sev sev-${severity.toLowerCase()}`}>
       {severity}{cvss != null ? ` · ${cvss.toFixed(1)}` : ''}
     </span>
+  );
+}
+
+function shortTime(ts) {
+  const d = ts ? new Date(ts) : null;
+  if (!d || isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function LogFeed({ messages, live }) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  if (msgs.length === 0) {
+    return (
+      <div className="logfeed">
+        <div className="logfeed-head">Devin activity</div>
+        <div className="logfeed-empty">{live ? 'Waiting for the first update…' : 'No activity yet.'}</div>
+      </div>
+    );
+  }
+  // Newest first, capped so the card stays compact.
+  const shown = msgs.slice(-8).reverse();
+  return (
+    <div className="logfeed">
+      <div className="logfeed-head">
+        Devin activity{live && <span className="logfeed-live"> · live</span>}
+      </div>
+      <ul className="logfeed-list">
+        {shown.map((m, i) => (
+          <li key={`${m.timestamp || ''}-${i}`} className={`logline logline-${(m.type || '').includes('user') ? 'user' : 'devin'}`}>
+            <span className="logline-time">{shortTime(m.timestamp)}</span>
+            <span className="logline-msg">{m.message}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
