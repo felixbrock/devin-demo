@@ -265,7 +265,7 @@ function LogFeed({ messages, live }) {
       </div>
       <ul className="logfeed-list">
         {shown.map((m, i) => (
-          <li key={`${m.timestamp || ''}-${i}`} className={`logline logline-${(m.type || '').includes('user') ? 'user' : 'devin'}`}>
+          <li key={`${m.timestamp || ''}-${i}`} className={`logline logline-${m.type || 'progress'}`}>
             <span className="logline-time">{shortTime(m.timestamp)}</span>
             <span className="logline-msg">{m.message}</span>
           </li>

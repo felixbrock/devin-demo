@@ -74,8 +74,11 @@ sequenceDiagram
 Key decisions: the session prompt makes tests **required** so every fix is
 independently verifiable; a structured output schema lets the operator read
 the PR and test results as JSON instead of parsing prose; failed sessions
-retry, blocked sessions get one autonomous-continue nudge, and a restart
-terminates orphaned sessions so state never dangles.
+retry, blocked sessions get one autonomous-continue nudge, and a session
+blocked with its PR already open counts as delivered (the pipeline is
+unattended). Sessions survive operator restarts: on startup the operator
+re-attaches to running sessions and polls them to completion, so state
+never dangles.
 
 ## Observability
 

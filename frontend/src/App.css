@@ -284,7 +284,13 @@ a { color: var(--ink); }
   padding-top: 1px;
 }
 .logline-msg { color: var(--muted); word-break: break-word; }
-.logline-user .logline-msg { color: var(--low); font-style: italic; }
+/* Event-kind styling */
+.logline-progress .logline-msg { color: var(--faint); }
+.logline-status .logline-msg { color: var(--low); }
+.logline-devin .logline-msg { color: var(--muted); font-style: italic; }
+.logline-milestone .logline-msg { color: var(--ink); font-weight: 500; }
+.logline-error .logline-msg { color: var(--crit); }
+/* Newest line always stands out */
 .logline:first-child .logline-msg { color: var(--ink); }
 
 /* Severity badge */

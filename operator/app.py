@@ -13,9 +13,10 @@ Receives labeled issues from the webhook receiver and, for each one:
    The operator only reads review status via the v3 Review API when
    DEVIN_ORG_ID / DEVIN_SERVICE_TOKEN are configured.
 
-Restart behavior: on startup any session still marked running is terminated
-via the Devin API and its issue marked failed (polling threads do not survive
-restarts). Re-adding the trigger label to a failed issue restarts it.
+Restart behavior: Devin sessions keep running when the operator restarts; on
+startup the operator re-attaches to any session still marked running and polls
+it to completion. A session blocked with its PR already open counts as done
+(unattended pipeline). Re-adding the trigger label to a failed issue restarts it.
 POST /reset terminates running sessions, closes PRs and branches, and
 recreates each tracked GitHub issue as a fresh copy (same content, new number).
 """
@@ -169,6 +170,20 @@ def init_db():
         )
     ''')
 
+    # Append-only activity log per session (operator lifecycle events + folded
+    # Devin messages) that drives the live feed on the dashboard
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS session_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            issue_id INTEGER,
+            ts TEXT,
+            kind TEXT,
+            message TEXT
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_session ON session_events(session_id)')
+
     # Create indexes for performance
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_issues_number ON issues(issue_number)')
@@ -201,6 +216,58 @@ def record_state_transition(issue_id, from_status, to_status, transition_type='m
 
     conn.commit()
     conn.close()
+
+
+def append_event(session_id, issue_id, kind, message):
+    """Append one activity event to a session's live feed.
+
+    kind is one of: 'milestone' (start/PR/tests/review/done), 'progress'
+    (working heartbeats), 'status' (Devin status changes), 'devin' (a real
+    Devin message), 'error'. Best-effort: never raise into the caller.
+    """
+    try:
+        conn = get_db()
+        conn.execute(
+            'INSERT INTO session_events (session_id, issue_id, ts, kind, message) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (session_id, issue_id, datetime.utcnow().isoformat() + 'Z', kind, (message or '')[:600])
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:  # pragma: no cover - logging only
+        print(f'[EVENT] failed to append ({kind}): {e}')
+
+
+def latest_session_feed(issue_db_id, limit=16):
+    """Most recent activity events for an issue's latest session (chronological)."""
+    if not issue_db_id:
+        return []
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        row = cur.execute(
+            'SELECT session_id FROM agent_sessions WHERE issue_id = ? '
+            'ORDER BY started_at DESC LIMIT 1', (issue_db_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return []
+        evs = cur.execute(
+            'SELECT ts, kind, message FROM session_events WHERE session_id = ? '
+            'ORDER BY id DESC LIMIT ?', (row['session_id'], limit)
+        ).fetchall()
+        conn.close()
+        return [{'type': e['kind'], 'message': e['message'], 'timestamp': e['ts']}
+                for e in reversed(evs)]
+    except Exception as e:  # pragma: no cover
+        print(f'[EVENT] feed read failed: {e}')
+        return []
+
+
+def fmt_elapsed(seconds):
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    return f'{m}m {s:02d}s' if m else f'{s}s'
 
 
 # Semaphore for limiting concurrent agent sessions
@@ -328,40 +395,87 @@ def github_request(method, path, **kwargs):
     return response
 
 
-def cleanup_stale_sessions():
+def resume_session_monitor(issue_id, session_id):
     """
-    Kill work left over from a previous operator process. Polling threads do
-    not survive a restart, so any session still marked running is untracked:
-    terminate it via the Devin API and fail its issue. Re-adding the trigger
-    label (or POST /issues/<id>/start) starts a fresh attempt.
+    Re-attach to a Devin session that outlived its polling thread (operator
+    restart). The session keeps running on Devin's side; poll it to completion
+    and finalize exactly like a fresh run. No retry here - if the resumed
+    session fails, re-adding the trigger label starts a new attempt.
     """
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT session_id FROM agent_sessions WHERE status IN ('starting', 'running')")
-    stale_sessions = [row['session_id'] for row in cursor.fetchall()]
-    cursor.execute("SELECT id, status FROM issues WHERE status IN ('pending', 'in_progress')")
-    stale_issues = [dict(row) for row in cursor.fetchall()]
+    cursor.execute('SELECT * FROM issues WHERE id = ?', (issue_id,))
+    issue = cursor.fetchone()
     conn.close()
 
-    for session_id in stale_sessions:
-        terminate_devin_session(session_id)
-        conn = get_db()
-        conn.execute('''
-            UPDATE agent_sessions
-            SET status = 'terminated',
-                error_details = 'Operator restarted; session terminated',
-                completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        ''', (session_id,))
-        conn.commit()
-        conn.close()
+    if not issue:
+        print(f"[RESUME] Issue {issue_id} not found for session {session_id}")
+        return
 
-    for issue in stale_issues:
+    issue_data = dict(issue)
+    append_event(session_id, issue_id, 'status',
+                 'Operator restarted — re-attached to the running Devin session')
+
+    try:
+        with session_semaphore:
+            session_result = poll_devin_session(session_id, issue_id)
+
+        if session_result['status'] == 'completed':
+            finalize_completed_session(issue_id, issue_data, session_id, session_result)
+            return
+
+        error_msg = session_result.get('error', 'Unknown error')
+    except Exception as e:
+        error_msg = str(e)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE agent_sessions
+        SET status = 'failed', error_details = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE session_id = ?
+    ''', (error_msg, session_id))
+    cursor.execute('''
+        UPDATE issues
+        SET status = 'failed', error_message = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (f'Resumed session failed: {error_msg}', issue_id))
+    conn.commit()
+    conn.close()
+    record_state_transition(issue_id, 'in_progress', 'failed', 'resumed_session_failed',
+                            {'error': error_msg, 'session_id': session_id})
+    append_event(session_id, issue_id, 'error', f'Resumed session failed: {error_msg}')
+
+
+def recover_inflight_work():
+    """
+    Reconcile state after an operator restart. Sessions still marked running
+    are re-attached and polled to completion (the Devin session itself never
+    stopped). Issues stuck in 'pending' with no session lost their thread
+    before a session was created - mark them failed so re-labeling restarts
+    them.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT session_id, issue_id FROM agent_sessions WHERE status IN ('starting', 'running')")
+    orphaned = [dict(row) for row in cursor.fetchall()]
+    resumed_issue_ids = {o['issue_id'] for o in orphaned}
+    cursor.execute("SELECT id, status FROM issues WHERE status IN ('pending', 'in_progress')")
+    stuck = [dict(row) for row in cursor.fetchall() if row['id'] not in resumed_issue_ids]
+    conn.close()
+
+    for o in orphaned:
+        thread = threading.Thread(target=resume_session_monitor,
+                                  args=(o['issue_id'], o['session_id']))
+        thread.daemon = True
+        thread.start()
+
+    for issue in stuck:
         conn = get_db()
         conn.execute('''
             UPDATE issues
             SET status = 'failed',
-                error_message = 'Operator restarted while this issue was in flight; session terminated',
+                error_message = 'Operator restarted before a session was created; re-add the label to retry',
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         ''', (issue['id'],))
@@ -369,9 +483,9 @@ def cleanup_stale_sessions():
         conn.close()
         record_state_transition(issue['id'], issue['status'], 'failed', 'operator_restarted')
 
-    if stale_sessions or stale_issues:
-        print(f'[STARTUP] Terminated {len(stale_sessions)} stale session(s), '
-              f'failed {len(stale_issues)} in-flight issue(s)')
+    if orphaned or stuck:
+        print(f'[STARTUP] Resumed {len(orphaned)} running session(s), '
+              f'failed {len(stuck)} issue(s) that never got a session')
 
 
 def poll_devin_session(session_id, issue_id):
@@ -383,7 +497,11 @@ def poll_devin_session(session_id, issue_id):
              'pull_request': ..., 'logs': ..., 'error': ...}
     """
     deadline = time.monotonic() + SESSION_TIMEOUT_SECONDS
+    started = time.monotonic()
     nudged_blocked = False
+    pr_recorded = False
+    seen_message_ids = set()
+    last_status = None
 
     while time.monotonic() < deadline:
         try:
@@ -418,27 +536,82 @@ def poll_devin_session(session_id, issue_id):
         conn.commit()
         conn.close()
 
+        # Fold any new real Devin messages into the feed
+        for m in (session.get('messages') or []):
+            mid = m.get('event_id') or m.get('timestamp')
+            text = (m.get('message') or '').strip()
+            if mid and mid not in seen_message_ids and text:
+                seen_message_ids.add(mid)
+                append_event(session_id, issue_id, 'devin', text)
+
+        # Note status changes as they happen
+        if status != last_status:
+            last_status = status
+            pretty = {
+                'working': 'Devin is working on the fix',
+                'blocked': 'Devin paused for input — nudging it to continue autonomously',
+                'resumed': 'Devin resumed',
+            }.get(status, f'Status: {status}')
+            append_event(session_id, issue_id, 'status', pretty)
+
+        # Deterministic heartbeat so the feed always advances, even when Devin
+        # is quiet between messages
+        append_event(session_id, issue_id, 'progress',
+                     f'Working on the fix… ({fmt_elapsed(time.monotonic() - started)} elapsed)')
+
+        structured = session.get('structured_output') or {}
+        pr_url_live = structured.get('pr_url') or (session.get('pull_request') or {}).get('url')
+
+        # Surface the PR on the ticket as soon as it exists, not only at
+        # session completion, so the dashboard links it while work continues
+        if pr_url_live and not pr_recorded:
+            pr_recorded = True
+            parsed = parse_pr_url(pr_url_live)
+            pr_number_live = structured.get('pr_number') or (parsed[2] if parsed else None)
+            conn = get_db()
+            conn.execute('''
+                UPDATE issues SET pr_url = ?, pr_number = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND pr_url IS NULL
+            ''', (pr_url_live, pr_number_live, issue_id))
+            conn.commit()
+            conn.close()
+            append_event(session_id, issue_id, 'milestone', f'Pull request opened: {pr_url_live}')
+
         if status == 'finished':
+            append_event(session_id, issue_id, 'milestone', 'Devin finished — collecting the pull request and results')
             return {
                 'status': 'completed',
-                'structured_output': session.get('structured_output') or {},
+                'structured_output': structured,
                 'pull_request': session.get('pull_request'),
                 'logs': f'Session finished. Final status: {status}'
             }
 
         if status == 'expired':
+            append_event(session_id, issue_id, 'error', 'Devin session expired before completing')
             return {'status': 'failed', 'error': 'Devin session expired before completing'}
 
-        if status == 'blocked' and not nudged_blocked:
+        if status == 'blocked':
             # Sessions block when Devin wants human input; this pipeline is
-            # unattended, so tell it once to proceed on its own judgment
-            nudged_blocked = True
-            send_session_message(
-                session_id,
-                'This session runs unattended. Make a reasonable autonomous decision, '
-                'note it in the PR description, and continue until the PR is open '
-                'and the structured output is filled in.'
-            )
+            # unattended. If the PR is already open, the deliverable exists -
+            # count the session as done. Otherwise tell it once to proceed on
+            # its own judgment.
+            if pr_url_live and nudged_blocked:
+                append_event(session_id, issue_id, 'milestone',
+                             'PR is open and Devin is waiting for input — collecting results')
+                return {
+                    'status': 'completed',
+                    'structured_output': structured,
+                    'pull_request': session.get('pull_request'),
+                    'logs': f'Session blocked with PR open; treated as complete. Final status: {status}'
+                }
+            if not nudged_blocked:
+                nudged_blocked = True
+                send_session_message(
+                    session_id,
+                    'This session runs unattended. Make a reasonable autonomous decision, '
+                    'note it in the PR description, and continue until the PR is open '
+                    'and the structured output is filled in.'
+                )
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -552,6 +725,81 @@ def get_devin_review_status(pr_url):
     return response.json()
 
 
+def finalize_completed_session(issue_id, issue_data, session_id, session_result):
+    """
+    Record a delivered session: normalize the PR description, read the Devin
+    Review status, and mark the issue and session completed.
+    Raises if the session reported no PR.
+    """
+    structured = session_result.get('structured_output') or {}
+
+    pr_url = structured.get('pr_url')
+    if not pr_url and session_result.get('pull_request'):
+        pr_url = session_result['pull_request'].get('url')
+
+    if not pr_url:
+        raise Exception('Session finished without reporting a PR')
+
+    parsed = parse_pr_url(pr_url)
+    pr_number = structured.get('pr_number') or (parsed[2] if parsed else None)
+
+    # Safety net: enforce the what/why/impact/tests PR template
+    ensure_pr_description(pr_url, issue_data, structured)
+
+    # Reviews are auto-triggered (repo enrolled in Devin Review
+    # auto-review); just record the current status if readable
+    review = {'method': 'auto_review', 'status': 'pending'}
+    try:
+        review_data = get_devin_review_status(pr_url)
+        if review_data:
+            review['status'] = review_data.get('status')
+    except requests.exceptions.RequestException as e:
+        print(f'[DEVIN REVIEW] Could not read review status: {e}')
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE issues
+        SET status = 'completed', pr_url = ?, pr_number = ?,
+            review_status = ?, review_method = ?,
+            test_results = ?, tests_added = ?,
+            completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (pr_url, pr_number, review.get('status'), review.get('method'),
+          structured.get('test_results'),
+          1 if structured.get('tests_added') else 0,
+          issue_id))
+    cursor.execute('''
+        UPDATE agent_sessions
+        SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP,
+            logs = COALESCE(logs, '') || ? || char(10)
+        WHERE session_id = ?
+    ''', (session_result.get('logs', ''), session_id))
+    conn.commit()
+    conn.close()
+
+    record_state_transition(issue_id, 'in_progress', 'completed', 'agent_completed', {
+        'pr_url': pr_url,
+        'pr_number': pr_number,
+        'tests_added': structured.get('tests_added'),
+        'test_results': structured.get('test_results'),
+        'review': {'method': review.get('method'), 'status': review.get('status')}
+    })
+
+    append_event(session_id, issue_id, 'milestone',
+                 f"Opened pull request #{pr_number}" if pr_number else "Opened pull request")
+    if structured.get('test_results'):
+        append_event(session_id, issue_id, 'milestone',
+                     f"Tests: {structured.get('test_results')}")
+    append_event(session_id, issue_id, 'milestone',
+                 f"Devin Review: {review.get('status') or 'pending'}")
+    append_event(session_id, issue_id, 'milestone',
+                 "Fix complete ✓")
+
+    print(f"[SUCCESS] Issue #{issue_data['issue_number']} completed: {pr_url}")
+
+
 def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
     """
     Process an issue end to end with retry logic on session failure:
@@ -601,66 +849,16 @@ def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
                     'attempt': attempt
                 })
 
-                session_result = poll_devin_session(session_data['session_id'], issue_id)
+                sid = session_data['session_id']
+                append_event(sid, issue_id, 'milestone',
+                             f"Devin session created (attempt {attempt}) — cloning {issue_data['repository']} "
+                             f"and reading issue #{issue_data['issue_number']}")
+
+                session_result = poll_devin_session(sid, issue_id)
 
             if session_result['status'] == 'completed':
-                structured = session_result.get('structured_output') or {}
-
-                pr_url = structured.get('pr_url')
-                if not pr_url and session_result.get('pull_request'):
-                    pr_url = session_result['pull_request'].get('url')
-
-                if not pr_url:
-                    raise Exception('Session finished without reporting a PR')
-
-                parsed = parse_pr_url(pr_url)
-                pr_number = structured.get('pr_number') or (parsed[2] if parsed else None)
-
-                # Safety net: enforce the what/why/impact/tests PR template
-                ensure_pr_description(pr_url, issue_data, structured)
-
-                # Reviews are auto-triggered (repo enrolled in Devin Review
-                # auto-review); just record the current status if readable
-                review = {'method': 'auto_review', 'status': 'pending'}
-                try:
-                    review_data = get_devin_review_status(pr_url)
-                    if review_data:
-                        review['status'] = review_data.get('status')
-                except requests.exceptions.RequestException as e:
-                    print(f'[DEVIN REVIEW] Could not read review status: {e}')
-
-                conn = get_db()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE issues
-                    SET status = 'completed', pr_url = ?, pr_number = ?,
-                        review_status = ?, review_method = ?,
-                        test_results = ?, tests_added = ?,
-                        completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                ''', (pr_url, pr_number, review.get('status'), review.get('method'),
-                      structured.get('test_results'),
-                      1 if structured.get('tests_added') else 0,
-                      issue_id))
-                cursor.execute('''
-                    UPDATE agent_sessions
-                    SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP,
-                        logs = COALESCE(logs, '') || ? || char(10)
-                    WHERE session_id = ?
-                ''', (session_result.get('logs', ''), session_data['session_id']))
-                conn.commit()
-                conn.close()
-
-                record_state_transition(issue_id, 'in_progress', 'completed', 'agent_completed', {
-                    'pr_url': pr_url,
-                    'pr_number': pr_number,
-                    'tests_added': structured.get('tests_added'),
-                    'test_results': structured.get('test_results'),
-                    'review': {'method': review.get('method'), 'status': review.get('status')}
-                })
-
-                print(f"[SUCCESS] Issue #{issue_data['issue_number']} completed: {pr_url}")
+                finalize_completed_session(issue_id, issue_data,
+                                           session_data['session_id'], session_result)
                 return True
 
             # Session failed; record and retry
@@ -686,10 +884,18 @@ def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
                 'attempt': attempt
             })
 
+            append_event(session_data['session_id'], issue_id, 'error',
+                         f'Attempt {attempt} failed: {error_msg}'
+                         + (' — retrying' if attempt < max_retries else ''))
+
             print(f"[RETRY] Issue #{issue_data['issue_number']} failed on attempt {attempt}")
 
         except Exception as e:
             print(f"[ERROR] Exception in processing issue #{issue_data['issue_number']}: {e}")
+            try:
+                append_event(session_data['session_id'], issue_id, 'error', f'Attempt {attempt} error: {e}')
+            except Exception:
+                pass
 
             if attempt == max_retries:
                 conn = get_db()
@@ -861,11 +1067,10 @@ def tracking_by_number():
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT i.issue_number, i.status, i.agent_session_id, i.pr_url, i.pr_number,
+        SELECT i.id AS issue_db_id,
+               i.issue_number, i.status, i.agent_session_id, i.pr_url, i.pr_number,
                i.branch_name, i.review_status, i.error_message, i.completed_at,
                i.test_results, i.tests_added,
-               (SELECT s.messages FROM agent_sessions s WHERE s.issue_id = i.id
-                    ORDER BY s.started_at DESC LIMIT 1) AS session_messages,
                (SELECT MIN(s.started_at) FROM agent_sessions s WHERE s.issue_id = i.id)
                    AS work_started_at
         FROM issues i
@@ -986,7 +1191,7 @@ def list_tickets():
             'test_results': track.get('test_results'),
             'tests_added': bool(track.get('tests_added')) if track.get('tests_added') is not None else None,
             'tests_passed': tests_passed_from(track.get('test_results')),
-            'messages': recent_messages(track.get('session_messages')),
+            'messages': latest_session_feed(track.get('issue_db_id')),
             'work_started_at': track.get('work_started_at'),
             'completed_at': track.get('completed_at'),
         })
@@ -1118,14 +1323,17 @@ def complete_session(session_id):
             WHERE id = ?
         ''', (pr_url, pr_number, issue_id))
 
+        # Commit before recording the transition: record_state_transition
+        # opens its own connection and would deadlock against our
+        # uncommitted writes
+        conn.commit()
+        conn.close()
+
         record_state_transition(issue_id, 'in_progress', 'completed', 'agent_completed', {
             'session_id': session_id,
             'pr_url': pr_url,
             'pr_number': pr_number
         })
-
-        conn.commit()
-        conn.close()
 
         return jsonify({
             'status': 'completed',
@@ -1303,9 +1511,9 @@ def health():
 
 init_db()
 try:
-    cleanup_stale_sessions()
+    recover_inflight_work()
 except Exception as e:
-    print(f'[STARTUP] Stale session cleanup failed: {e}')
+    print(f'[STARTUP] In-flight work recovery failed: {e}')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8001, debug=True)
