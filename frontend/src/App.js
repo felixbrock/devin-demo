@@ -122,7 +122,7 @@ function App() {
         {attempted > 0 && (
           <p className="stats-note">
             {(counts.completed || 0)} of {attempted} attempted ticket{attempted === 1 ? '' : 's'} remediated
-            {' '}with a passing-test PR.
+            {' '}with a pull request.
           </p>
         )}
       </section>
@@ -175,7 +175,6 @@ function App() {
                   <th className="c-sev">Severity</th>
                   <th className="c-status">Status</th>
                   <th className="c-time">Agent time</th>
-                  <th className="c-tests">Tests</th>
                   <th className="c-review">Review</th>
                   <th className="c-pr">PR</th>
                 </tr>
@@ -197,7 +196,6 @@ function App() {
                     </td>
                     <td className="c-status"><StatusDot status={r.status} /></td>
                     <td className="c-time">{r.workingMs != null ? formatElapsed(r.workingMs) : '—'}</td>
-                    <td className="c-tests"><TestsCell r={r} /></td>
                     <td className="c-review"><ReviewCell r={r} /></td>
                     <td className="c-pr">
                       {r.pr_url ? (
@@ -273,19 +271,6 @@ function LogFeed({ messages, live }) {
       </ul>
     </div>
   );
-}
-
-function TestsCell({ r }) {
-  if (r.tests_passed === true) {
-    return <span className="badge badge-ok" title={r.test_results || 'Tests pass'}>✓ Tests pass</span>;
-  }
-  if (r.tests_passed === false) {
-    return <span className="badge badge-bad" title={r.test_results || 'Tests failing'}>✗ Tests fail</span>;
-  }
-  if (r.status === 'completed' && r.tests_added) {
-    return <span className="badge badge-neutral" title={r.test_results || 'Tests added'}>Tests added</span>;
-  }
-  return <span className="muted">—</span>;
 }
 
 const REVIEW_MAP = {

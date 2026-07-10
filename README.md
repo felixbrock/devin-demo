@@ -1,6 +1,6 @@
 # Devin Demo — Automated Issue Remediation
 
-Label a GitHub issue `devin-fix`. The system spins up a **Devin** session that writes a root-cause fix plus a test that fails before and passes after, opens a PR, and gets an automatic Devin Review. A live dashboard tracks every issue from open to merged.
+Label a GitHub issue `devin-fix`. The system spins up a **Devin** session that writes a root-cause fix and opens a PR as its final action, which completes the ticket and triggers an automatic Devin Review. A live dashboard tracks every issue from open to merged.
 
 Target repo is a fork of Apache Superset; the security tickets to remediate carry the `created by Devin` label.
 
@@ -57,28 +57,29 @@ sequenceDiagram
     GH->>WH: issues webhook (action=labeled)
     WH->>WH: verify HMAC signature, filter for the trigger label
     WH->>OP: forward the issue
-    OP->>DV: POST /v1/sessions — fix task, required tests, JSON output schema (parallel, capped at 3)
-    loop every 60s until finished
+    OP->>DV: POST /v1/sessions — fix task + JSON output schema (parallel, capped at 3)
+    loop until the PR exists
         OP->>DV: GET /v1/sessions/id — poll status, nudge once if blocked
     end
-    DV->>GH: push branch, open PR (root-cause fix + tests that fail without it)
+    DV->>GH: push branch, open PR as the session's final action
+    Note over OP: PR detected → ticket completed
     GH->>GH: Devin Review auto-runs on the new PR
-    OP->>GH: normalize PR body to Summary / Why / Impact / Tests
+    OP->>GH: normalize PR body to Summary / Why / Impact
     loop every 4s
         DB->>OP: GET /tickets
         OP->>GH: read tickets by label + review status
-        OP-->>DB: live status, agent time, tests, review, PR link
+        OP-->>DB: live status, agent time, review, PR link
     end
 ```
 
-Key decisions: the session prompt makes tests **required** so every fix is
-independently verifiable; a structured output schema lets the operator read
-the PR and test results as JSON instead of parsing prose; failed sessions
-retry, blocked sessions get one autonomous-continue nudge, and a session
-blocked with its PR already open counts as delivered (the pipeline is
-unattended). Sessions survive operator restarts: on startup the operator
-re-attaches to running sessions and polls them to completion, so state
-never dangles.
+Key decisions: the session prompt makes opening the PR the session's **final
+action**, so the operator can complete the ticket the moment the PR exists —
+no waiting for the session to wind down; a structured output schema lets the
+operator read the PR details as JSON instead of parsing prose; failed
+sessions retry and blocked sessions get one autonomous-continue nudge (the
+pipeline is unattended). Sessions survive operator restarts: on startup the
+operator re-attaches to running sessions and polls them to completion, so
+state never dangles.
 
 ## Observability
 
@@ -86,11 +87,11 @@ The dashboard is the "how do I know it's working" view, keyed off the `created b
 
 - Overview counts — total / in progress / queued / completed / failed — plus a **success-rate** tile (completed / attempted)
 - Live cards per running session with a per-second agent-working timer
-- Per ticket — status, severity (from the CVSS score in the ticket), live agent working time, a **Tests** badge (pass / fail / added, from Devin's reported test run), a **Review** badge (Devin Review verdict), and a link to the PR
+- Per ticket — status, severity (from the CVSS score in the ticket), live agent working time, a **Review** badge (Devin Review verdict), and a link to the PR
 - Failed rows show the failure reason inline
 - Full audit trail of state transitions per issue in the operator database
 
-Together these answer the leader's question directly — not just that PRs are being produced, but that each fix ships with a passing test and a review verdict.
+Together these answer the leader's question directly — not just that PRs are being produced, but that each fix ships with an independent review verdict.
 
 ## Configuration
 
@@ -109,7 +110,7 @@ Together these answer the leader's question directly — not just that PRs are b
 
 - **Event-driven** — a GitHub label event triggers the pipeline (webhook or direct POST).
 - **Devin as the primitive** — the operator programmatically creates, polls, nudges, and reviews Devin sessions; Devin does the actual remediation.
-- **Observable outputs** — PRs with tests, normalized PR write-ups, Devin Reviews, and a live dashboard with per-ticket test/review verdicts, success rate, and throughput.
+- **Observable outputs** — PRs with normalized what/why/impact write-ups, Devin Reviews, and a live dashboard with per-ticket review verdicts, success rate, and throughput.
 
 ## Development
 

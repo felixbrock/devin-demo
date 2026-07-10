@@ -3,8 +3,8 @@ Operator service - Core logic for managing Devin agent sessions
 
 Receives labeled issues from the webhook receiver and, for each one:
 1. Creates a Devin session via the Devin API (v1) with instructions to fix
-   the issue, add tests that make the fix verifiable, and open a PR in
-   Superset with a what/why/impact summary that references the tests run
+   the issue and open a PR in Superset with a what/why/impact summary as
+   its final action - the ticket completes the moment the PR is raised
 2. Polls the session until it finishes and extracts the PR it created
 3. Normalizes the PR description via the GitHub API (safety net)
 4. Records the Devin Review on the PR. Reviews are triggered automatically:
@@ -78,16 +78,9 @@ SESSION_OUTPUT_SCHEMA = {
         "pr_number": {"type": "integer", "description": "Number of the pull request"},
         "branch_name": {"type": "string", "description": "Branch the fix was pushed to"},
         "summary": {"type": "string", "description": "What was changed and why"},
-        "impact": {"type": "string", "description": "Impact of the change on users and the codebase"},
-        "tests_added": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Paths of test files added or modified to verify the fix"
-        },
-        "test_command": {"type": "string", "description": "Command used to run the tests"},
-        "test_results": {"type": "string", "description": "Outcome of the test run"}
+        "impact": {"type": "string", "description": "Impact of the change on users and the codebase"}
     },
-    "required": ["pr_url", "branch_name", "summary", "tests_added", "test_results"]
+    "required": ["pr_url", "branch_name", "summary"]
 }
 
 
@@ -124,8 +117,7 @@ def init_db():
     ''')
 
     # Columns added after the initial schema; ignore failures on fresh DBs
-    for column_def in ('issue_body TEXT', 'review_status TEXT', 'review_method TEXT',
-                       'test_results TEXT', 'tests_added INTEGER'):
+    for column_def in ('issue_body TEXT', 'review_status TEXT', 'review_method TEXT'):
         try:
             cursor.execute(f'ALTER TABLE issues ADD COLUMN {column_def}')
         except sqlite3.OperationalError:
@@ -310,23 +302,20 @@ Follow these steps:
    investigate the issue until you understand the root cause.
 2. Implement a fix that addresses the root cause. Keep the change minimal and
    consistent with the surrounding code.
-3. REQUIRED: add or extend automated tests that fail without your fix and pass
-   with it, so the fix is independently verifiable. Place them following the
-   repository's existing test conventions.
-4. Run the tests you added (plus any directly related existing tests) and make
-   sure they pass. Record the exact command you used and the results.
-5. Push the branch and open a pull request against the default branch of
+3. Finish ALL remaining work on the branch first. Opening the pull request
+   must be your final action - do not open it while anything is unfinished,
+   because the PR is treated as the signal that the work is complete.
+4. Push the branch and open a pull request against the default branch of
    {issue_data['repository']}. The PR description MUST contain these sections:
    - ## Summary - what was changed
    - ## Why - the problem from issue #{issue_data['issue_number']} and why this is the right fix (link the issue)
    - ## Impact - effect on users and the codebase, including any risks
-   - ## Tests - the test files you added, the command you ran, and the results
-6. Fill in the structured output with the PR URL, PR number, branch name,
-   summary, impact, the list of test files, the test command, and the test
-   results. Keep it updated as you make progress.
+5. Immediately after opening the PR, fill in the structured output with the
+   PR URL, PR number, branch name, summary, and impact.
 
-Do not merge the PR. If you get blocked, make a reasonable autonomous decision
-and note it in the PR description instead of waiting for input."""
+Work quickly and autonomously. Do not merge the PR. If you get blocked, make
+a reasonable decision, note it in the PR description, and move on instead of
+waiting for input."""
 
 
 def create_devin_session(issue_data, branch_name, attempt=1):
@@ -522,7 +511,6 @@ def poll_devin_session(session_id, issue_id):
     started = time.monotonic()
     epoch = RESET_EPOCH
     nudged_blocked = False
-    pr_recorded = False
     seen_message_ids = set()
     last_status = None
 
@@ -589,20 +577,17 @@ def poll_devin_session(session_id, issue_id):
         structured = session.get('structured_output') or {}
         pr_url_live = structured.get('pr_url') or (session.get('pull_request') or {}).get('url')
 
-        # Surface the PR on the ticket as soon as it exists, not only at
-        # session completion, so the dashboard links it while work continues
-        if pr_url_live and not pr_recorded:
-            pr_recorded = True
-            parsed = parse_pr_url(pr_url_live)
-            pr_number_live = structured.get('pr_number') or (parsed[2] if parsed else None)
-            conn = get_db()
-            conn.execute('''
-                UPDATE issues SET pr_url = ?, pr_number = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND pr_url IS NULL
-            ''', (pr_url_live, pr_number_live, issue_id))
-            conn.commit()
-            conn.close()
+        # The PR is the deliverable, and the task prompt makes it the
+        # session's final action - so the moment one exists, the ticket is
+        # done. Don't wait for the session to wind itself down.
+        if pr_url_live:
             append_event(session_id, issue_id, 'milestone', f'Pull request opened: {pr_url_live}')
+            return {
+                'status': 'completed',
+                'structured_output': structured,
+                'pull_request': session.get('pull_request'),
+                'logs': f'PR raised - ticket complete. Session status at completion: {status}'
+            }
 
         if status == 'finished':
             append_event(session_id, issue_id, 'milestone', 'Devin finished — collecting the pull request and results')
@@ -617,28 +602,16 @@ def poll_devin_session(session_id, issue_id):
             append_event(session_id, issue_id, 'error', 'Devin session expired before completing')
             return {'status': 'failed', 'error': 'Devin session expired before completing'}
 
-        if status == 'blocked':
+        if status == 'blocked' and not nudged_blocked:
             # Sessions block when Devin wants human input; this pipeline is
-            # unattended. If the PR is already open, the deliverable exists -
-            # count the session as done. Otherwise tell it once to proceed on
-            # its own judgment.
-            if pr_url_live and nudged_blocked:
-                append_event(session_id, issue_id, 'milestone',
-                             'PR is open and Devin is waiting for input — collecting results')
-                return {
-                    'status': 'completed',
-                    'structured_output': structured,
-                    'pull_request': session.get('pull_request'),
-                    'logs': f'Session blocked with PR open; treated as complete. Final status: {status}'
-                }
-            if not nudged_blocked:
-                nudged_blocked = True
-                send_session_message(
-                    session_id,
-                    'This session runs unattended. Make a reasonable autonomous decision, '
-                    'note it in the PR description, and continue until the PR is open '
-                    'and the structured output is filled in.'
-                )
+            # unattended, so tell it once to proceed on its own judgment
+            nudged_blocked = True
+            send_session_message(
+                session_id,
+                'This session runs unattended. Make a reasonable autonomous decision, '
+                'note it in the PR description, and continue until the PR is open '
+                'and the structured output is filled in.'
+            )
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -685,9 +658,6 @@ def severity_for_cvss(cvss):
 
 def build_pr_body(issue_data, structured):
     """Build the standardized PR description from the session's structured output"""
-    tests = structured.get('tests_added') or []
-    tests_list = '\n'.join(f'- `{t}`' for t in tests) if tests else '- (none reported)'
-
     return f"""## Summary
 
 {structured.get('summary', f"Fix for issue #{issue_data['issue_number']}: {issue_data['issue_title']}")}
@@ -700,14 +670,6 @@ Resolves #{issue_data['issue_number']} ({issue_data['issue_url']}): {issue_data[
 
 {structured.get('impact', 'See summary above.')}
 
-## Tests
-
-{tests_list}
-
-Command: `{structured.get('test_command', 'n/a')}`
-
-Results: {structured.get('test_results', 'n/a')}
-
 ---
 **Automated fix by Devin AI** via the devin-demo operator.
 Session-created PR; description normalized by the operator.
@@ -716,7 +678,7 @@ Session-created PR; description normalized by the operator.
 
 def ensure_pr_description(pr_url, issue_data, structured):
     """
-    Safety net: overwrite the PR body with the standardized what/why/impact/tests
+    Safety net: overwrite the PR body with the standardized what/why/impact
     template built from the session's structured output. Skipped when no
     GITHUB_TOKEN is configured (Devin's own PR description is kept).
     """
@@ -789,12 +751,9 @@ def finalize_completed_session(issue_id, issue_data, session_id, session_result)
         UPDATE issues
         SET status = 'completed', pr_url = ?, pr_number = ?,
             review_status = ?, review_method = ?,
-            test_results = ?, tests_added = ?,
             completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
     ''', (pr_url, pr_number, review.get('status'), review.get('method'),
-          structured.get('test_results'),
-          1 if structured.get('tests_added') else 0,
           issue_id))
     cursor.execute('''
         UPDATE agent_sessions
@@ -809,16 +768,11 @@ def finalize_completed_session(issue_id, issue_data, session_id, session_result)
     record_state_transition(issue_id, 'in_progress', 'completed', 'agent_completed', {
         'pr_url': pr_url,
         'pr_number': pr_number,
-        'tests_added': structured.get('tests_added'),
-        'test_results': structured.get('test_results'),
         'review': {'method': review.get('method'), 'status': review.get('status')}
     })
 
     append_event(session_id, issue_id, 'milestone',
                  f"Opened pull request #{pr_number}" if pr_number else "Opened pull request")
-    if structured.get('test_results'):
-        append_event(session_id, issue_id, 'milestone',
-                     f"Tests: {structured.get('test_results')}")
     append_event(session_id, issue_id, 'milestone',
                  f"Devin Review: {review.get('status') or 'pending'}")
     append_event(session_id, issue_id, 'milestone',
@@ -830,7 +784,7 @@ def finalize_completed_session(issue_id, issue_data, session_id, session_result)
 def process_issue_with_retry(issue_id, max_retries=MAX_RETRIES):
     """
     Process an issue end to end with retry logic on session failure:
-    Devin session (fix + tests + PR) -> PR description normalization ->
+    Devin session (fix + PR) -> PR description normalization ->
     record Devin Review status (review itself is auto-triggered on PR creation)
     """
     conn = get_db()
@@ -1116,7 +1070,6 @@ def tracking_by_number():
         SELECT i.id AS issue_db_id,
                i.issue_number, i.status, i.agent_session_id, i.pr_url, i.pr_number,
                i.branch_name, i.review_status, i.error_message, i.completed_at,
-               i.test_results, i.tests_added,
                (SELECT MIN(s.started_at) FROM agent_sessions s WHERE s.issue_id = i.id)
                    AS work_started_at
         FROM issues i
@@ -1155,40 +1108,6 @@ def recent_messages(raw, limit=14):
             'timestamp': m.get('timestamp'),
         })
     return out
-
-
-def tests_passed_from(text):
-    """Best-effort pass/fail read of Devin's free-text test_results.
-
-    Returns True (clearly passing), False (clearly failing), or None (unknown /
-    not reported). Conservative by design: it must not read a passing run that
-    says "0 failed" / "no failures" as a failure, so negated failure wording is
-    ignored and only a real non-zero failure count or an un-negated failure word
-    yields False.
-    """
-    if not text:
-        return None
-    t = text.lower()
-
-    # Explicit non-zero failure count, e.g. "2 failed", "1 test failure".
-    m = re.search(r'(\d+)\s*(?:test\w*\s*)?(?:failed|failing|failures?|errors?)', t)
-    if m and int(m.group(1)) > 0:
-        return False
-
-    negated_fail = any(p in t for p in (
-        '0 failed', '0 failures', 'no failures', 'no failing', 'none failed',
-        'without failures', '0 errors', 'no errors',
-    ))
-    has_pass = any(p in t for p in (
-        'pass', 'passed', 'passing', 'all green', 'succeeded', 'success',
-    ))
-    has_fail = ('fail' in t or 'error' in t) and not negated_fail
-
-    if has_fail:
-        return False
-    if has_pass:
-        return True
-    return None
 
 
 @app.route('/tickets', methods=['GET'])
@@ -1234,9 +1153,6 @@ def list_tickets():
             'branch_name': track.get('branch_name'),
             'review_status': track.get('review_status'),
             'error_message': track.get('error_message'),
-            'test_results': track.get('test_results'),
-            'tests_added': bool(track.get('tests_added')) if track.get('tests_added') is not None else None,
-            'tests_passed': tests_passed_from(track.get('test_results')),
             'messages': latest_session_feed(track.get('issue_db_id')),
             'work_started_at': track.get('work_started_at'),
             'completed_at': track.get('completed_at'),
