@@ -12,13 +12,20 @@ docker-compose up --build     # webhook :8000 · operator :8001 · dashboard :30
 open http://localhost:3000
 ```
 
-**Trigger it** — either add the `devin-fix` label to an issue in the fork (via a GitHub webhook, see below), or drive the pipeline directly without exposing an endpoint:
+`GITHUB_TOKEN` needs write access to the fork (list tickets, normalize PR
+bodies, reset): reuse `gh auth token`, or create a fine-grained PAT scoped to
+the fork with **Issues**, **Pull requests**, and **Contents** read/write. A
+classic token with `public_repo` also works. After editing `.env`, recreate
+the container with `docker compose up -d operator` — a plain `restart` does
+not re-read `.env`.
+
+**Trigger it** — either add the `devin-fix` label to an issue in the fork (via a GitHub webhook, see below), or drive the pipeline directly without exposing an endpoint. Use a currently open `created by Devin` ticket — numbers change after each reset:
 
 ```bash
 curl -X POST http://localhost:8001/issues -H 'Content-Type: application/json' -d '{
-  "issue_number": 24,
-  "issue_title": "Unsafe YAML deserialization via yaml.Loader in example import",
-  "issue_url": "https://github.com/felixbrock/superset/issues/24",
+  "issue_number": 49,
+  "issue_title": "Security: Unsafe YAML deserialization via yaml.Loader in example import",
+  "issue_url": "https://github.com/felixbrock/superset/issues/49",
   "repository": "felixbrock/superset"
 }'
 ```
@@ -35,7 +42,7 @@ For real webhook triggering, point **repo → Settings → Webhooks** at `https:
 ./reset.sh          # or: curl -X POST http://localhost:8001/reset
 ```
 
-Restores a clean slate — terminates running Devin sessions, closes the PRs and deletes their branches, closes each processed issue and recreates a fresh copy (same title/body/labels, minus the trigger label, new number), and clears the local database. Re-add `devin-fix` to run again.
+Restores a clean slate — cancels all in-flight worker threads (so nothing retries against the wiped state), terminates running Devin sessions, closes the PRs and deletes their branches, closes each processed issue (stripping the demo labels so it drops out of the dashboard) and recreates a fresh copy (same title/body/labels, minus the trigger label, new number), sweeps GitHub for any stray `devin/fix-issue-*` PRs the database doesn't know about, and clears the local database. Re-add `devin-fix` to run again.
 
 ## How It Works
 
@@ -114,7 +121,7 @@ Together these answer the leader's question directly — not just that PRs are b
 
 ## Development
 
-Run any service outside Docker with `pip install -r requirements.txt && python app.py` (webhook, operator) or `npm install && npm start` (frontend).
+Run any service outside Docker with `pip install -r requirements.txt && python app.py` (webhook; for the operator set a local database path: `DB_PATH=./devin_demo.db python app.py`) or `npm install && npm start` (frontend).
 
 ## License
 
