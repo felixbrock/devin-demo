@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  webhook:
+    build: ./webhook
+    ports:
+      - "8000:8000"
+    environment:
+      - OPERATOR_URL=http://operator:8001
+      - TARGET_LABEL=${TARGET_LABEL:-devin-fix}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+    depends_on:
+      - operator
+    volumes:
+      - ./webhook:/app
+    networks:
+      - devin-network
+
+  operator:
+    build: ./operator
+    ports:
+      - "8001:8001"
+    environment:
+      - DEVIN_API_KEY=${DEVIN_API_KEY:?set DEVIN_API_KEY in .env}
+      - DEVIN_API_URL=${DEVIN_API_URL:-https://api.devin.ai}
+      - DEVIN_ORG_ID=${DEVIN_ORG_ID:-}
+      - DEVIN_SERVICE_TOKEN=${DEVIN_SERVICE_TOKEN:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - REPO_OWNER=${REPO_OWNER:-felixbrock}
+      - REPO_NAME=${REPO_NAME:-superset}
+      - TARGET_LABEL=${TARGET_LABEL:-devin-fix}
+      - CATALOG_LABEL=${CATALOG_LABEL:-created by Devin}
+      - MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-3}
+      - MAX_RETRIES=${MAX_RETRIES:-2}
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-60}
+      - SESSION_TIMEOUT_SECONDS=${SESSION_TIMEOUT_SECONDS:-7200}
+    volumes:
+      - ./operator:/app
+      - operator_data:/app/data
+    networks:
+      - devin-network
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=${REACT_APP_API_URL:-http://localhost:8001}
+    depends_on:
+      - operator
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - devin-network
+
+networks:
+  devin-network:
+    driver: bridge
+
+volumes:
+  operator_data:

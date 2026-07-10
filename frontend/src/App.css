@@ -1,0 +1,410 @@
+:root {
+  --paper: #f7f6f5;
+  --ink: #000000;
+  --muted: rgba(20, 20, 20, 0.72);
+  --faint: rgba(20, 20, 20, 0.46);
+  --line: rgba(25, 25, 25, 0.18);
+  --line-strong: rgba(25, 25, 25, 0.34);
+  --accent: #3d37f5;
+
+  --crit: #a01b1b;
+  --high: #b5541b;
+  --med: #8a6d1f;
+  --low: #556070;
+
+  --sans: "Helvetica Neue", Helvetica, Arial, "Inter", system-ui, sans-serif;
+  --serif: "Georgia", "Times New Roman", Times, serif;
+
+  --gut: max(24px, calc((100vw - 1180px) / 2));
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+code {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 0.85em;
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  background: rgba(0, 0, 0, 0.02);
+}
+
+a { color: var(--ink); }
+
+.page {
+  position: relative;
+  max-width: 1180px;
+  margin: 0 auto;
+  /* Fixed padding: the box is already centered by margin auto; viewport-based
+     padding here would exceed the capped width on wide screens and crush the
+     content to min-content. --gut is only for the fixed-position rules. */
+  padding: 0 24px 80px;
+  min-height: 100vh;
+}
+
+/* Faint vertical column rules, like the Cognition site */
+.rule {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+  pointer-events: none;
+  z-index: 0;
+}
+.rule-a { left: max(24px, calc((100vw - 1180px) / 2)); }
+.rule-b { right: max(24px, calc((100vw - 1180px) / 2)); }
+
+/* Masthead */
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 40px 0 30px;
+  border-bottom: 1px solid var(--line-strong);
+}
+.mark {
+  font-family: var(--sans);
+  font-size: 30px;
+  line-height: 1;
+  color: var(--ink);
+}
+.masthead-text { flex: 1; }
+.masthead h1 {
+  font-family: var(--sans);
+  font-weight: 500;
+  font-size: 28px;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+.masthead p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+.repo { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 13px; }
+
+.conn {
+  font-family: var(--sans);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 5px 10px;
+  border: 1px solid var(--line-strong);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.conn::before {
+  content: "";
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.conn-up::before { background: #2e7d46; animation: pulse 1.8s infinite; }
+.conn-down::before { background: var(--crit); }
+
+/* Section bands */
+.band {
+  position: relative;
+  padding: 34px 0;
+  border-bottom: 1px solid var(--line);
+}
+.marker {
+  position: absolute;
+  left: -1px;
+  top: 38px;
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--faint);
+  letter-spacing: 0.05em;
+}
+.band h2 {
+  font-family: var(--sans);
+  font-weight: 500;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  margin: 0 0 22px;
+  padding-left: 46px;
+}
+
+.empty {
+  padding-left: 46px;
+  color: var(--muted);
+  font-size: 16px;
+  max-width: 620px;
+}
+
+/* Stats */
+.stats {
+  display: grid;
+  /* minmax(0, 1fr) lets tracks shrink below their content width; plain 1fr
+     refuses to and overflows the 1180 page when the system font renders the
+     labels wider than a narrow fallback (which shoved the whole page right). */
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px;
+  margin-left: 46px;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+.stat {
+  background: var(--paper);
+  padding: 22px 20px;
+  min-width: 0;
+  overflow: hidden;
+}
+.stat-n {
+  font-family: var(--sans);
+  font-size: 44px;
+  font-weight: 400;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+.stat-l {
+  margin-top: 8px;
+  font-family: var(--sans);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.stat-accent .stat-n { color: var(--accent); }
+
+/* Active cards */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+  margin-left: 46px;
+}
+.card {
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.card-live { box-shadow: inset 3px 0 0 var(--accent); }
+.card-top { display: flex; align-items: center; justify-content: space-between; }
+.issue-ref {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 14px;
+  text-decoration: none;
+  color: var(--muted);
+}
+.issue-ref:hover { color: var(--ink); }
+.card h3 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 18px;
+  line-height: 1.35;
+  margin: 0;
+}
+.card-meta { display: flex; align-items: center; justify-content: space-between; }
+.cat {
+  font-family: var(--sans);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.timer {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.timer-val {
+  font-family: var(--sans);
+  font-size: 26px;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.timer-lbl {
+  font-family: var(--sans);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+}
+/* Severity badge */
+.sev {
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  padding: 3px 8px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.sev-critical { color: var(--crit); }
+.sev-high { color: var(--high); }
+.sev-medium { color: var(--med); }
+.sev-low { color: var(--low); }
+.sev-none { color: var(--faint); }
+.unrated { color: var(--faint); }
+
+/* Tests / Review badges (mirror the severity badge outline style) */
+.badge {
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  padding: 3px 8px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.badge-ok { color: #2e7d46; }
+.badge-bad { color: var(--crit); }
+.badge-warn { color: var(--med); }
+.badge-neutral { color: var(--low); }
+.muted { color: var(--faint); }
+
+/* Success-rate note under the overview stats */
+.stats-note {
+  margin: 14px 0 0 46px;
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Inline failure reason under a failed ticket's title */
+.row-error {
+  margin-top: 4px;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--crit);
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Error banner */
+.banner {
+  margin: 18px 0 0 46px;
+  padding: 12px 16px;
+  border: 1px solid var(--crit);
+  color: var(--crit);
+  font-family: var(--sans);
+  font-size: 13px;
+}
+
+/* Status */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.status .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+}
+.status-identified .dot { background: var(--faint); }
+.status-pending .dot { background: var(--med); }
+.status-in_progress .dot { background: var(--accent); animation: pulse 1.4s infinite; }
+.status-in_progress { color: var(--accent); }
+.status-completed .dot { background: #2e7d46; }
+.status-failed .dot { background: var(--crit); }
+.status-failed { color: var(--crit); }
+
+/* Table */
+.table-wrap { margin-left: 46px; overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+thead th {
+  font-family: var(--sans);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-align: left;
+  padding: 0 14px 12px;
+  border-bottom: 1px solid var(--line-strong);
+}
+tbody td {
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+tbody tr:hover { background: rgba(0, 0, 0, 0.015); }
+.row-live { background: rgba(61, 55, 245, 0.04); }
+.row-live:hover { background: rgba(61, 55, 245, 0.06); }
+
+.c-num { width: 62px; }
+.c-num a {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 13px;
+  color: var(--muted);
+  text-decoration: none;
+}
+.c-num a:hover { color: var(--ink); }
+.title-cell { line-height: 1.35; }
+.cat-inline {
+  display: block;
+  font-family: var(--sans);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  margin-top: 3px;
+}
+.c-sev { width: 128px; }
+.c-status { width: 132px; }
+.c-time {
+  width: 96px;
+  font-family: var(--sans);
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+}
+.c-pr { width: 64px; }
+.c-pr a {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 13px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.c-pr a:hover { text-decoration: underline; }
+
+/* Footer */
+.foot {
+  padding: 30px 0 0 46px;
+  max-width: 720px;
+}
+.foot span {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (max-width: 1024px) {
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 720px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .marker { display: none; }
+  .band h2, .cards, .table-wrap, .stats, .empty, .foot { margin-left: 0; padding-left: 0; }
+  .rule { display: none; }
+}
